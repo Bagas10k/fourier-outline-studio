@@ -10,7 +10,7 @@ python3 fourier_outline.py example.csv -o demo.html
 python3 -m unittest -v
 ```
 
-Input: CSV `x,y` satu titik per baris, atau SVG berisi **tepat satu** `polygon`/`polyline` dengan atribut `points`. Outline otomatis ditutup; SVG `<path>`, lubang, dan multi-kontur belum didukung. Ekspor SVG hasil rekonstruksi dari tombol di browser.
+Input: CSV `x,y` satu titik per baris, atau SVG berisi **tepat satu** `polygon`, `polyline`, atau `<path>` tertutup (`Z`). Path mendukung `M/L/H/V/C/S/Q/T` absolut maupun relatif, termasuk kurva Bézier; transformasi, busur `A`, lubang, dan multi-kontur ditolak terang-terangan (bukan digambar keliru). Outline polygon/polyline otomatis ditutup. Ekspor SVG hasil rekonstruksi dari tombol di browser.
 
 ```bash
 python3 fourier_outline.py outline.svg -o hasil.html --samples 512 --harmonics 120 --error 0.005

@@ -8,16 +8,101 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 
+NUMBER = r'[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?'
+PATH_TOKEN = re.compile(rf'[A-Za-z]|{NUMBER}')
+
+
+def svg_path_points(d):
+    tokens = PATH_TOKEN.findall(d)
+    if re.sub(r'[\s,]+', '', PATH_TOKEN.sub('', d)):
+        raise ValueError('Invalid SVG path syntax')
+    points, i, command = [], 0, None
+    cursor = 0j
+    start = None
+    previous_control = None
+    previous_curve = None
+    arity = {'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4, 'Q': 4, 'T': 2}
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            command = tokens[i]
+            i += 1
+            if command.upper() == 'Z':
+                if start is None or i < len(tokens):
+                    raise ValueError('Closed SVG path required; multiple subpaths not supported')
+                break
+            if command.upper() not in arity:
+                raise ValueError(f'Unsupported SVG path command: {command}')
+            if command.upper() == 'M' and start is not None:
+                raise ValueError('SVG multiple subpaths not supported')
+        if command is None or len(tokens) - i < arity[command.upper()] or any(x.isalpha() for x in tokens[i:i + arity[command.upper()]]):
+            raise ValueError('Incomplete SVG path command')
+        size = arity[command.upper()]
+        values = [float(x) for x in tokens[i:i + size]]
+        if not all(math.isfinite(x) for x in values):
+            raise ValueError('SVG coordinates must be finite')
+        i += size
+        relative = command.islower()
+        point = lambda x, y: complex(x, y) + (cursor if relative else 0)
+        op = command.upper()
+        if op in ('M', 'L', 'T'):
+            end = point(*values)
+            if op == 'M':
+                start = end
+                points.append(end)
+                command = 'l' if relative else 'L'
+            elif op == 'T':
+                control = 2 * cursor - previous_control if previous_curve == 'Q' else cursor
+                points.extend(curve_points(cursor, [control], end))
+                previous_control = control
+            else:
+                points.append(end)
+        elif op == 'H':
+            end = complex(cursor.real + values[0] if relative else values[0], cursor.imag)
+            points.append(end)
+        elif op == 'V':
+            end = complex(cursor.real, cursor.imag + values[0] if relative else values[0])
+            points.append(end)
+        else:
+            controls = [point(values[j], values[j + 1]) for j in range(0, size - 2, 2)]
+            end = point(values[-2], values[-1])
+            if op in ('S',):
+                controls.insert(0, 2 * cursor - previous_control if previous_curve == 'C' else cursor)
+            points.extend(curve_points(cursor, controls, end))
+            previous_control = controls[-1]
+        cursor = end
+        if op not in ('C', 'S', 'Q', 'T'):
+            previous_control = None
+        previous_curve = 'C' if op in ('C', 'S') else 'Q' if op in ('Q', 'T') else None
+    if command is None or command.upper() != 'Z':
+        raise ValueError('SVG path must end with Z (closed outline)')
+    return points
+
+
+def curve_points(start, controls, end):
+    # ponytail: fixed 16 subdivisions per curve; use adaptive flattening if tight high-curvature paths lose detail.
+    if len(controls) == 1:
+        (a,) = controls
+        return [(1 - t) ** 2 * start + 2 * (1 - t) * t * a + t * t * end for t in (j / 16 for j in range(1, 17))]
+    a, b = controls
+    return [(1 - t) ** 3 * start + 3 * (1 - t) ** 2 * t * a + 3 * (1 - t) * t * t * b + t ** 3 * end for t in (j / 16 for j in range(1, 17))]
+
+
 def load_points(path):
     if path.suffix.lower() == '.svg':
         root = ET.parse(path).getroot()
-        shapes = [e for e in root.iter() if e.tag.rsplit('}', 1)[-1] in ('polygon', 'polyline')]
+        shapes = [e for e in root.iter() if e.tag.rsplit('}', 1)[-1] in ('polygon', 'polyline', 'path')]
         if len(shapes) != 1:
-            raise ValueError('SVG must contain exactly one polygon/polyline (SVG path is not supported)')
-        nums = [float(x) for x in re.findall(r'[-+]?(?:\d*\.\d+|\d+\.?\d*)(?:[eE][-+]?\d+)?', shapes[0].get('points', ''))]
-        if len(nums) < 6 or len(nums) % 2:
-            raise ValueError('Need at least three x,y points')
-        points = [complex(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
+            raise ValueError('SVG must contain exactly one polygon, polyline, or path')
+        shape = shapes[0]
+        if any(e.get('transform') for e in root.iter()):
+            raise ValueError('SVG transform is not supported')
+        if shape.tag.rsplit('}', 1)[-1] == 'path':
+            points = svg_path_points(shape.get('d', ''))
+        else:
+            nums = [float(x) for x in re.findall(NUMBER, shape.get('points', ''))]
+            if len(nums) < 6 or len(nums) % 2:
+                raise ValueError('Need at least three x,y points')
+            points = [complex(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
     else:
         points = []
         for line in path.read_text().splitlines():
@@ -25,6 +110,8 @@ def load_points(path):
                 continue
             a, b = line.split(',')
             points.append(complex(float(a), float(b)))
+    if not all(math.isfinite(p.real) and math.isfinite(p.imag) for p in points):
+        raise ValueError('All coordinates must be finite')
     if len(points) > 1 and points[-1] == points[0]:
         points.pop()
     if len(set(points)) < 3:
@@ -64,15 +151,23 @@ def coefficients(points, limit):
 
 
 def choose(points, coeffs, threshold):
-    total = sum(abs(p - sum(points) / len(points)) ** 2 for p in points) / len(points)
+    center = sum(points) / len(points)
+    total = math.fsum(abs(p - center) ** 2 for p in points) / len(points)
     ordered = sorted(coeffs, key=lambda item: abs(item[1]), reverse=True)
     selected, energy = [], 0
+    def relative_error():
+        residual = max(0, total - energy)
+        # Roundoff at full reconstruction must not appear as a fake 1e-8 error.
+        if residual <= 1e-14 * total:
+            return 0.0
+        return math.sqrt(residual / total)
     for term in ordered:
         selected.append(term)
-        energy += abs(term[1]) ** 2
-        if total == 0 or math.sqrt(max(0, total - energy) / total) <= threshold:
+        energy = math.fsum(abs(c) ** 2 for _, c in selected)
+        if total == 0 or relative_error() <= threshold:
             break
-    return selected, math.sqrt(max(0, total - energy) / total) if total else 0
+    return selected, relative_error() if total else 0.0
+
 
 
 def render(points, center, selected, error):
